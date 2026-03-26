@@ -10,6 +10,7 @@ Column-level AES-256-CBC encryption and decryption using Snowflake's native `ENC
 - Decrypt-on-read masking policies for authorized roles
 - Fake data generation via Python UDF (Faker)
 - Stage-based bulk export workflow
+- Cross-platform compatibility with Postgres pgcrypto (encrypt in Snowflake, decrypt in Postgres and vice versa)
 - Three key management strategies (see below)
 - Per-column external functions for fully server-side crypto (key never leaves the cloud)
 - Sample AWS Lambda and Azure Function code included
@@ -137,7 +138,7 @@ Use these in your backend for **audit logging**, **rate limiting**, or **per-use
 8. `CREATE SECURE EXTERNAL FUNCTION` pointing to the APIM endpoint
 9. Test: `SELECT get_aes_key_azure('MY_PASSPHRASE');`
 
-## Cipher Format
+## Cipher Format & Postgres pgcrypto Compatibility
 
 All approaches produce the same wire format:
 
@@ -145,7 +146,59 @@ All approaches produce the same wire format:
 BASE64( IV_16_bytes || ciphertext_bytes )
 ```
 
-This is compatible with Postgres `pgcrypto` AES-CBC and can be decoded in any language that supports standard Base64 and AES-CBC.
+This format is **directly compatible with PostgreSQL's `pgcrypto` extension**. Data encrypted in Snowflake can be decrypted in Postgres and vice versa, using the same AES-256 key. This enables seamless cross-platform encryption workflows — for example, encrypting data in Snowflake and decrypting it in a Postgres application database, or migrating encrypted data between the two without re-encryption.
+
+### Decrypt Snowflake ciphertext in Postgres
+
+```sql
+-- Enable pgcrypto
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Snowflake-produced ciphertext (BASE64 of iv || ciphertext)
+-- Decode, split IV (first 16 bytes) and ciphertext (remainder), then decrypt.
+SELECT convert_from(
+    decrypt_iv(
+        substring(decode('<snowflake_base64_ciphertext>', 'base64') FROM 17),  -- ciphertext (skip 16-byte IV)
+        decode('<base64_aes_key>', 'base64'),                                  -- AES-256 key
+        substring(decode('<snowflake_base64_ciphertext>', 'base64') FOR 16),   -- IV (first 16 bytes)
+        'aes-cbc/pad:pkcs'
+    ),
+    'UTF8'
+);
+```
+
+### Encrypt in Postgres, decrypt in Snowflake
+
+```sql
+-- In Postgres: encrypt with pgcrypto and prepend the IV
+SELECT encode(
+    iv || encrypt_iv(
+        convert_to('Hello from Postgres', 'UTF8'),
+        decode('<base64_aes_key>', 'base64'),
+        iv,
+        'aes-cbc/pad:pkcs'
+    ),
+    'base64'
+)
+FROM (SELECT gen_random_bytes(16) AS iv) AS t;
+
+-- In Snowflake: decrypt the Postgres-produced ciphertext
+SELECT decrypt_cbc('<postgres_base64_ciphertext>', '<base64_aes_key>');
+-- => 'Hello from Postgres'
+```
+
+### Compatibility notes
+
+| Aspect | Snowflake | Postgres pgcrypto |
+|--------|-----------|-------------------|
+| Algorithm | AES-CBC via `ENCRYPT_RAW` / `DECRYPT_RAW` | AES-CBC via `encrypt_iv` / `decrypt_iv` |
+| Padding | PKCS#7 (default) | `pad:pkcs` |
+| IV | Random 16 bytes, prepended to ciphertext | Must be explicitly prepended |
+| Key size | 256-bit (32 bytes, Base64-encoded) | 256-bit (32 bytes) |
+| Wire format | `BASE64(IV \|\| ciphertext)` | Same when constructed as shown above |
+| Encoding | UTF-8 plaintext | UTF-8 plaintext |
+
+The same format works with any language or framework that supports AES-256-CBC with PKCS#7 padding (Python `cryptography`, Node.js `crypto`, Java `javax.crypto`, Go `crypto/aes`, etc.).
 
 ## Quick Start
 
