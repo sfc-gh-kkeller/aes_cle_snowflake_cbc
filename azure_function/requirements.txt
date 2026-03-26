@@ -1,0 +1,4 @@
+azure-functions>=1.17
+azure-identity>=1.14
+azure-keyvault-secrets>=4.7
+cryptography>=41.0
