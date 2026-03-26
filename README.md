@@ -219,6 +219,583 @@ When using KEY_PER_QUERY, the Snowflake query profile shows two distinct steps:
 
 The key insight: the external function call happens **once** at compile time. The returned key becomes a plan constant used by all DECRYPT_RAW operations in execution — this is why column scaling is sub-linear.
 
+## Architecture & Data Flows
+
+### End-to-End Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                        AES-256-CBC COLUMN-LEVEL ENCRYPTION                       │
+│                                                                                  │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐         │
+│  │ 01 Session  │   │ 02 UDF Key  │   │ 03 External │   │ 04 HYOK Key │         │
+│  │   Variable  │   │    Vault    │   │  Func + KMS │   │   Wrapping  │         │
+│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘   └──────┬──────┘         │
+│         │                 │                  │                  │                 │
+│    SET var=key     get_aes_key()      ext func → KMS     ext func → KMS         │
+│         │                 │                  │             + SHA-256 wrap         │
+│         │                 │                  │                  │                 │
+│         ▼                 ▼                  ▼                  ▼                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐    │
+│  │                     AES-256 Key (32 bytes, Base64)                       │    │
+│  └─────────────────────────────────┬────────────────────────────────────────┘    │
+│                                    │                                             │
+│                     ┌──────────────┴──────────────┐                              │
+│                     ▼                             ▼                               │
+│              ENCRYPT_RAW()                  DECRYPT_RAW()                         │
+│              + RANDOM IV                    + IV from cipher                      │
+│                     │                             │                               │
+│                     ▼                             ▼                               │
+│           BASE64(IV ‖ ciphertext)          UTF-8 plaintext                       │
+│           (pgcrypto-compatible)                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Approach Decision Tree
+
+```
+                        How sensitive is the data?
+                                   │
+                   ┌───────────────┼───────────────┐
+                   ▼               ▼               ▼
+              Dev / POC      Production       Regulated / HYOK
+                   │               │               │
+                   ▼               ▼               ▼
+            ┌──────────┐   ┌──────────┐   ┌──────────────────┐
+            │    01     │   │    02    │   │ Key in Snowflake │
+            │  Session  │   │   UDF   │   │   acceptable?    │
+            │ Variable  │   │  Vault  │   └────────┬─────────┘
+            └──────────┘   └──────────┘       Yes  │  No
+                                               │    │
+                                               ▼    ▼
+                                          ┌──────┐ ┌──────┐
+                                          │  03  │ │  04  │
+                                          │ Ext  │ │ HYOK │
+                                          │ Func │ │ Wrap │
+                                          └──────┘ └──────┘
+                                               │    │
+                                       ┌───────┘    └───────┐
+                                       ▼                    ▼
+                                  Key retrieval      Key wrapping
+                                  (key transits      (key derived in
+                                   Snowflake)         session context)
+                                       │
+                                       ├── OR ──┐
+                                       ▼        ▼
+                                  Server-side   Key never
+                                    crypto      leaves cloud
+```
+
+### Encryption Data Flow (Write Path)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ENCRYPT ON WRITE                                  │
+│                                                                             │
+│  Application / SQL                                                          │
+│  ┌──────────────────────────────────────────────────────┐                   │
+│  │ INSERT INTO encrypted_table                          │                   │
+│  │   SELECT encrypt_cbc_random_iv(plaintext, aes_key)   │                   │
+│  │   FROM source_table;                                 │                   │
+│  └────────────────────────┬─────────────────────────────┘                   │
+│                           │                                                 │
+│                           ▼                                                 │
+│  ┌─────────────────────────────────────────────────────┐                    │
+│  │              encrypt_cbc_random_iv()                 │                    │
+│  │                                                     │                    │
+│  │  plaintext (UTF-8)                                  │                    │
+│  │       │                                             │                    │
+│  │       ▼                                             │                    │
+│  │  ┌───────────────┐    ┌────────────────┐            │                    │
+│  │  │ RANDOM_BYTES  │    │  AES-256 Key   │            │                    │
+│  │  │   (16 bytes)  │    │  (32 bytes)    │            │                    │
+│  │  └───────┬───────┘    └───────┬────────┘            │                    │
+│  │          │ IV                 │ Key                  │                    │
+│  │          ▼                    ▼                      │                    │
+│  │  ┌────────────────────────────────┐                  │                    │
+│  │  │       ENCRYPT_RAW()            │                  │                    │
+│  │  │   mode = AES-CBC / PKCS#7      │                  │                    │
+│  │  └───────────────┬────────────────┘                  │                    │
+│  │                  │                                   │                    │
+│  │                  ▼                                   │                    │
+│  │  ┌────────────────────────────────┐                  │                    │
+│  │  │  IV (16B) ‖ ciphertext (nB)   │                  │                    │
+│  │  └───────────────┬────────────────┘                  │                    │
+│  │                  │                                   │                    │
+│  │                  ▼                                   │                    │
+│  │  ┌────────────────────────────────┐                  │                    │
+│  │  │       BASE64_ENCODE()          │                  │                    │
+│  │  └───────────────┬────────────────┘                  │                    │
+│  │                  │                                   │                    │
+│  │                  ▼                                   │                    │
+│  │  "dGVzdC1pdi4uLnRlc3QtY2lwaGVydGV4dA=="             │                    │
+│  └─────────────────────────────────────────────────────┘                    │
+│                           │                                                 │
+│                           ▼                                                 │
+│                  ┌─────────────────┐                                        │
+│                  │  Snowflake Table │                                        │
+│                  │  (VARCHAR col)   │                                        │
+│                  └─────────────────┘                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Decryption Data Flow (Read Path)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          DECRYPT ON READ                                    │
+│                                                                             │
+│  ┌─────────────────┐                                                        │
+│  │  Snowflake Table │  stored: "dGVzdC1pdi4uLnRlc3QtY2lwaGVydGV4dA=="      │
+│  │  (VARCHAR col)   │                                                       │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────────────────────────────────────────┐                    │
+│  │               decrypt_cbc()                         │                    │
+│  │                                                     │                    │
+│  │  Base64 ciphertext                                  │                    │
+│  │       │                                             │                    │
+│  │       ▼                                             │                    │
+│  │  ┌────────────────────────────────┐                  │                    │
+│  │  │    BASE64_DECODE_BINARY()      │                  │                    │
+│  │  └───────────────┬────────────────┘                  │                    │
+│  │                  │                                   │                    │
+│  │                  ▼                                   │                    │
+│  │  ┌─────────────────────────────────┐                 │                    │
+│  │  │  raw bytes: IV (16B) ‖ CT (nB)  │                 │                    │
+│  │  └──────┬───────────────┬──────────┘                 │                    │
+│  │         │               │                            │                    │
+│  │   bytes[1:16]     bytes[17:]                         │                    │
+│  │    = IV            = ciphertext                      │                    │
+│  │         │               │         ┌──────────────┐   │                    │
+│  │         │               │         │ AES-256 Key  │   │                    │
+│  │         ▼               ▼         └──────┬───────┘   │                    │
+│  │  ┌────────────────────────────────────────────┐      │                    │
+│  │  │            DECRYPT_RAW()                    │      │                    │
+│  │  │   mode = AES-CBC / PKCS#7                   │      │                    │
+│  │  └──────────────────┬─────────────────────────┘      │                    │
+│  │                     │                                 │                    │
+│  │                     ▼                                 │                    │
+│  │            plaintext (UTF-8)                          │                    │
+│  └─────────────────────────────────────────────────────┘                    │
+│           │                                                                 │
+│           ▼                                                                 │
+│  SELECT result → "Hello, World!"                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### External Function + KMS Data Flow (Approach 03)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ SNOWFLAKE                          │ AWS / AZURE                                    │
+│                                    │                                                │
+│  SELECT decrypt_cbc(               │                                                │
+│    col,                            │                                                │
+│    get_aes_key_aws('pass')         │                                                │
+│  )                                 │                                                │
+│    │                               │                                                │
+│    │  ┌──────────────────────────┐ │ ┌──────────────┐   ┌─────────────────────────┐│
+│    ├─▶│  get_aes_key_aws()       │─┼▶│ API Gateway  │──▶│  Lambda (handler.py)    ││
+│    │  │  SECURE EXTERNAL FUNC    │ │ │  (REST API)  │   │                         ││
+│    │  │  + CONTEXT_HEADERS       │ │ │              │   │  1. Validate passphrase ││
+│    │  │  + IMMUTABLE (cacheable) │ │ │  Headers:    │   │  2. KMS Decrypt()       ││
+│    │  └──────────────────────────┘ │ │  sf-context-*│   │  3. Return Base64 key   ││
+│    │                               │ │              │   │                         ││
+│    │  ┌──────────────────────────┐ │ │              │   │  ┌───────────────────┐  ││
+│    │◀─│  AES key (Base64)        │◀┼─│              │◀──│  │ KMS CMK           │  ││
+│    │  └──────────────────────────┘ │ │              │   │  │ (decrypt data key)│  ││
+│    │                               │ └──────────────┘   │  └───────────────────┘  ││
+│    ▼                               │                    └─────────────────────────┘│
+│  ┌────────────────────────┐        │                                                │
+│  │  DECRYPT_RAW(          │        │                                                │
+│  │    ciphertext,         │        │                                                │
+│  │    key,                │        │        ── OR ──                                 │
+│  │    iv,                 │        │                                                │
+│  │    'AES-CBC'           │        │                                                │
+│  │  )                     │        │  ┌──────────────┐   ┌─────────────────────────┐│
+│  └────────────┬───────────┘        │  │ API Gateway  │──▶│  Lambda                 ││
+│               │                    │  │              │   │  (crypto_handler.py)    ││
+│               ▼                    │  │  Headers:    │   │                         ││
+│          plaintext                 │  │  X-Operation │   │  1. KMS Decrypt key     ││
+│                                    │  │  X-Data-Elem │   │  2. AES-CBC encrypt     ││
+│  KEY RETRIEVAL pattern:            │  │              │   │     or decrypt          ││
+│  Key transits Snowflake            │  │              │   │  3. Return result       ││
+│                                    │  │              │   │                         ││
+│  SERVER-SIDE CRYPTO pattern:       │  │              │   │  Key NEVER leaves       ││
+│  Key stays in Lambda               │  └──────────────┘   │  Lambda environment     ││
+│                                    │                    └─────────────────────────┘│
+└────────────────────────────────────┴────────────────────────────────────────────────┘
+```
+
+### HYOK Key Wrapping Data Flow (Approach 04)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                     KEY_IN_SESSION — Full Lifecycle                                   │
+│                                                                                      │
+│  ① Session Activation (once per session)                                             │
+│  ─────────────────────────────────────────                                           │
+│                                                                                      │
+│  CALL sp_hyok_activate_session('pass')                                               │
+│    │                                                                                 │
+│    ├─ 1. External function call ─────────────────────────────────────────┐            │
+│    │     hyok_fetch_key('pass')                                          │            │
+│    │                                                                     ▼            │
+│    │                                              ┌─────────────────────────────┐     │
+│    │                                              │  API GW → Lambda → KMS      │     │
+│    │                                              │  Returns: kms_secret (B64)  │     │
+│    │     ◀────────────────────────────────────────│                             │     │
+│    │                                              └─────────────────────────────┘     │
+│    │                                                                                 │
+│    ├─ 2. Key derivation (pure SQL, no network)                                       │
+│    │     SHA256(kms_secret || '|' || CURRENT_SESSION() || '|' || CURRENT_USER())     │
+│    │       │                                                                         │
+│    │       ▼                                                                         │
+│    │     wrapped_tmk (32 bytes, Base64)                                              │
+│    │                                                                                 │
+│    ├─ 3. Store in session                                                            │
+│    │     SET HYOK_TMK = '<wrapped_tmk>'                                              │
+│    │                                                                                 │
+│    ▼                                                                                 │
+│  Session ready — GETVARIABLE('HYOK_TMK') available                                   │
+│                                                                                      │
+│  ② Query Execution (zero outbound calls)                                             │
+│  ────────────────────────────────────────                                             │
+│                                                                                      │
+│  SELECT * FROM employees_encrypted;                                                  │
+│    │                                                                                 │
+│    ▼  Masking policy (decrypt_hyok_session) fires:                                   │
+│  ┌──────────────────────────────────────────────────┐                                │
+│  │ IS_ROLE_IN_SESSION('ACCOUNTADMIN')? ──── No ───▶ '** HYOK key not loaded **'      │
+│  │       │ Yes                                      │                                │
+│  │       ▼                                          │                                │
+│  │ GETVARIABLE('HYOK_TMK') IS NOT NULL? ── No ───▶ │                                │
+│  │       │ Yes                                      │                                │
+│  │       ▼                                          │                                │
+│  │ decrypt_cbc(val, GETVARIABLE('HYOK_TMK'))        │                                │
+│  │       │                                          │                                │
+│  │       ▼                                          │                                │
+│  │    plaintext                                     │                                │
+│  └──────────────────────────────────────────────────┘                                │
+│                                                                                      │
+│  ③ Session Teardown                                                                  │
+│  ──────────────────                                                                  │
+│                                                                                      │
+│  UNSET HYOK_TMK;  ──▶  Key purged from session. Queries return masked values.        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                     KEY_PER_QUERY — Full Lifecycle                                    │
+│                                                                                      │
+│  SELECT * FROM employees_encrypted;                                                  │
+│                                                                                      │
+│  ┌─── Compile Phase (Step 1) ───────────────────────────────────────────────────┐    │
+│  │                                                                               │    │
+│  │  Masking policy fires → calls udf_hyok_fetch_wrapped_key()                    │    │
+│  │    │                                                                          │    │
+│  │    ├── hyok_fetch_key('MY_PASSPHRASE')                                        │    │
+│  │    │     │                                                                    │    │
+│  │    │     ▼                                                                    │    │
+│  │    │   API GW → Lambda → KMS → returns kms_secret                             │    │
+│  │    │     │                                                                    │    │
+│  │    │     ▼                                                                    │    │
+│  │    ├── derive_session_key(kms_secret, session_salt)                            │    │
+│  │    │     │                                                                    │    │
+│  │    │     ▼                                                                    │    │
+│  │    │   SHA256(kms_secret || '|' || session || '|' || user)                    │    │
+│  │    │     │                                                                    │    │
+│  │    │     ▼                                                                    │    │
+│  │    └── wrapped_tmk becomes a PLAN CONSTANT                                    │    │
+│  │                                                                               │    │
+│  │  Time: ~1.2s (Lambda 38ms + KMS + compile overhead)                           │    │
+│  └───────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                      │
+│  ┌─── Execution Phase (Step 2) ─────────────────────────────────────────────────┐    │
+│  │                                                                               │    │
+│  │  For each row in TableScan:                                                   │    │
+│  │    DECRYPT_RAW(ciphertext, plan_constant_tmk, iv, 'AES-CBC/PAD:PKCS')        │    │
+│  │                                                                               │    │
+│  │  Pure CPU — no network calls, no Lambda invocations                           │    │
+│  │  Time: ~9-12s for 50M rows / 7 cols on L warehouse                            │    │
+│  │  Column scaling: sub-linear (TMK fetched once, reused for all columns)        │    │
+│  └───────────────────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Security Trust Boundaries
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                              TRUST BOUNDARY DIAGRAM                                  │
+│                                                                                      │
+│  ┌─ SNOWFLAKE (Compute & Storage) ─────────────────────────────────────────────┐     │
+│  │                                                                              │     │
+│  │  ┌─ User Session ──────────────────────────────────────────────────────┐     │     │
+│  │  │                                                                      │     │     │
+│  │  │  Session Variables     GETVARIABLE('HYOK_TMK')                       │     │     │
+│  │  │  ┌──────────────┐    (key in session memory,                        │     │     │
+│  │  │  │ SET key=...  │     wiped on UNSET or disconnect)                  │     │     │
+│  │  │  └──────────────┘                                                    │     │     │
+│  │  │         ⚠ Key visible in QUERY_HISTORY for approach 01               │     │     │
+│  │  └──────────────────────────────────────────────────────────────────────┘     │     │
+│  │                                                                              │     │
+│  │  ┌─ SQL Runtime ──────────────────────────────────────────────────────┐      │     │
+│  │  │                                                                     │      │     │
+│  │  │  ENCRYPT_RAW / DECRYPT_RAW                                          │      │     │
+│  │  │  Key exists in memory during query execution only                   │      │     │
+│  │  │  SECURE UDFs / functions hide definition from non-owners            │      │     │
+│  │  │  Masking policies enforce role-based access                         │      │     │
+│  │  └─────────────────────────────────────────────────────────────────────┘      │     │
+│  │                                                                              │     │
+│  │  ┌─ Masking Policy Layer ─────────────────────────────────────────────┐      │     │
+│  │  │                                                                     │      │     │
+│  │  │  IS_ROLE_IN_SESSION() → gate                                        │      │     │
+│  │  │  GETVARIABLE()        → session key (04-session)                    │      │     │
+│  │  │  ext_func()           → per-query key (03, 04-per-query)            │      │     │
+│  │  │  get_aes_key()        → UDF vault key (02)                          │      │     │
+│  │  │  $var                 → session variable (01)                        │      │     │
+│  │  └─────────────────────────────────────────────────────────────────────┘      │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                          │                                           │
+│                                   HTTPS (TLS 1.2+)                                   │
+│                                          │                                           │
+│  ┌─ CLOUD PROVIDER (AWS / Azure) ────────┴─────────────────────────────────────┐     │
+│  │                                                                              │     │
+│  │  ┌─ API Gateway / APIM ──────────────────────────────────────────────┐      │     │
+│  │  │  IAM role assumption (AWS) or Azure AD auth                        │      │     │
+│  │  │  IP allowlisting (optional)                                        │      │     │
+│  │  │  Request/response logged (CloudTrail / Azure Monitor)              │      │     │
+│  │  └────────────────────────────────────────────────────────────────────┘      │     │
+│  │                                                                              │     │
+│  │  ┌─ Lambda / Azure Function ─────────────────────────────────────────┐      │     │
+│  │  │  Passphrase validation                                              │      │     │
+│  │  │  Audit logging (sf-context-* headers, query ID)                     │      │     │
+│  │  │  Key cached in warm-start memory (not persisted)                    │      │     │
+│  │  │                                                                     │      │     │
+│  │  │  Server-side crypto mode: encrypt/decrypt happens HERE              │      │     │
+│  │  │  Key retrieval mode: decrypted key returned to Snowflake            │      │     │
+│  │  └────────────────────────────────────────────────────────────────────┘      │     │
+│  │                                                                              │     │
+│  │  ┌─ KMS / Key Vault ────────────────────────────────────────────────┐       │     │
+│  │  │  Master key (CMK) never leaves HSM                                │       │     │
+│  │  │  Data key encrypted at rest, decrypted by CMK on demand           │       │     │
+│  │  │  Rotation managed by cloud provider                               │       │     │
+│  │  │  All decrypt operations logged (CloudTrail / Key Vault audit)     │       │     │
+│  │  └───────────────────────────────────────────────────────────────────┘       │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                      │
+│  KEY EXPOSURE BY APPROACH:                                                            │
+│  ┌─────────────┬────────────────┬──────────────────┬─────────────────────────────┐   │
+│  │  Approach   │  In Snowflake  │  In Transit      │  In Cloud Provider          │   │
+│  ├─────────────┼────────────────┼──────────────────┼─────────────────────────────┤   │
+│  │ 01 Session  │ ✗ query hist   │ N/A              │ N/A                         │   │
+│  │ 02 UDF      │ ✗ UDF body     │ N/A              │ N/A                         │   │
+│  │ 03 Key Ret  │ ✗ runtime mem  │ ✗ TLS encrypted  │ ✓ HSM-protected             │   │
+│  │ 03 Srv Cry  │ ✓ never        │ ✓ never          │ ✓ Lambda memory only        │   │
+│  │ 04 HYOK     │ ✗ derived key  │ ✗ raw secret TLS │ ✓ HSM-protected             │   │
+│  └─────────────┴────────────────┴──────────────────┴─────────────────────────────┘   │
+│  ✗ = key present    ✓ = key NOT present / protected                                  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Masking Policy Decision Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                      MASKING POLICY EXECUTION FLOW                           │
+│                                                                              │
+│  SELECT col FROM table                                                       │
+│    │                                                                         │
+│    ▼                                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │  Column has masking policy attached? │                                    │
+│  └──────────┬───────────────────────────┘                                    │
+│        No   │   Yes                                                          │
+│        │    │                                                                │
+│        │    ▼                                                                │
+│        │  ┌───────────────────────────────┐                                  │
+│        │  │ OR: Table/column has TAG with │                                  │
+│        │  │ masking policy attached?      │                                  │
+│        │  └──────────┬────────────────────┘                                  │
+│        │        No   │   Yes                                                 │
+│        │        │    │                                                       │
+│        ▼        ▼    ▼                                                       │
+│  raw value   ┌──────────────────────────────────────────────────────┐        │
+│  returned    │          MASKING POLICY EVALUATES                     │        │
+│              │                                                      │        │
+│              │  ┌──────────────────────────────────────────┐        │        │
+│              │  │  IS_ROLE_IN_SESSION('ACCOUNTADMIN')?     │        │        │
+│              │  └─────────┬─────────────────┬──────────────┘        │        │
+│              │       No   │            Yes  │                       │        │
+│              │       │    │                 │                       │        │
+│              │       ▼    │                 ▼                       │        │
+│              │  '** masked **'   ┌─────────────────────┐           │        │
+│              │                   │  Which key source?   │           │        │
+│              │                   └──┬──────┬──────┬─────┘           │        │
+│              │                      │      │      │                │        │
+│              │           ┌──────────┘      │      └──────────┐     │        │
+│              │           ▼                 ▼                 ▼     │        │
+│              │   ┌──────────────┐  ┌──────────────┐  ┌──────────┐ │        │
+│              │   │ 01/02: hard- │  │ 03/04 session│  │ 03/04    │ │        │
+│              │   │ coded key or │  │ GETVARIABLE  │  │ ext func │ │        │
+│              │   │ UDF call     │  │ ('HYOK_TMK') │  │ per-query│ │        │
+│              │   └──────┬───────┘  └──────┬───────┘  └────┬─────┘ │        │
+│              │          │                 │               │       │        │
+│              │          │           ┌─────┴─────┐         │       │        │
+│              │          │           │ NULL?     │         │       │        │
+│              │          │           ├─ Yes: masked        │       │        │
+│              │          │           └─ No: key ready      │       │        │
+│              │          │                 │               │       │        │
+│              │          ▼                 ▼               ▼       │        │
+│              │  ┌──────────────────────────────────────────────┐  │        │
+│              │  │         decrypt_cbc(val, key)                │  │        │
+│              │  │         → DECRYPT_RAW → plaintext            │  │        │
+│              │  └──────────────────────────────────────────────┘  │        │
+│              └───────────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Lambda Processing Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    LAMBDA INTERNAL PROCESSING                                │
+│                                                                              │
+│  ┌─ handler.py (Key Retrieval) ─────────────────────────────────────────┐   │
+│  │                                                                       │   │
+│  │  event.body = {"data": [[0, "MY_PASSPHRASE"]]}                        │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  Extract: sf-context-current-user, sf-context-current-account         │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  ┌───────────────────────────────┐                                    │   │
+│  │  │ Validate passphrase           │── Fail ──▶ [row_id, null]          │   │
+│  │  └───────────┬───────────────────┘                                    │   │
+│  │         Pass │                                                        │   │
+│  │              ▼                                                        │   │
+│  │  ┌───────────────────────────────┐                                    │   │
+│  │  │ Warm-start cache hit?         │── Yes ──▶ Return cached key        │   │
+│  │  └───────────┬───────────────────┘                                    │   │
+│  │           No │                                                        │   │
+│  │              ▼                                                        │   │
+│  │  ┌───────────────────────────────┐                                    │   │
+│  │  │ KMS Decrypt(                  │                                    │   │
+│  │  │   CiphertextBlob,             │                                    │   │
+│  │  │   KeyId = CMK ARN             │                                    │   │
+│  │  │ )                             │                                    │   │
+│  │  └───────────┬───────────────────┘                                    │   │
+│  │              │ response["Plaintext"]                                   │   │
+│  │              ▼                                                        │   │
+│  │  ┌───────────────────────────────┐                                    │   │
+│  │  │ Cache + Base64 encode         │                                    │   │
+│  │  └───────────┬───────────────────┘                                    │   │
+│  │              ▼                                                        │   │
+│  │  Return: {"data": [[0, "base64-aes-key"]]}                            │   │
+│  └───────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─ crypto_handler.py (Server-Side Crypto) ─────────────────────────────┐   │
+│  │                                                                       │   │
+│  │  event.body = {"data": [[0, "plaintext_or_cipher"]]}                  │   │
+│  │  event.headers = { X-Operation: "encrypt"|"decrypt",                  │   │
+│  │                     X-Data-Element: "name"|"address"|"phone" }        │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  KMS Decrypt → AES key bytes (cached on warm start)                   │   │
+│  │    │                                                                  │   │
+│  │    ├── encrypt:                                                       │   │
+│  │    │   random IV → AES-CBC encrypt → BASE64(IV ‖ ciphertext)          │   │
+│  │    │                                                                  │   │
+│  │    └── decrypt:                                                       │   │
+│  │        BASE64 decode → split IV/CT → AES-CBC decrypt → plaintext      │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  Return: {"data": [[0, "result"]]}                                    │   │
+│  └───────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─ key_wrapping_handler.py (HYOK) ─────────────────────────────────────┐   │
+│  │                                                                       │   │
+│  │  event.body = {"data": [[0, "MY_PASSPHRASE"]]}                        │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  Extract: sf-context-current-user, sf-context-current-account,        │   │
+│  │           sf-external-function-current-query-id                        │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  ┌───────────────────────────────┐                                    │   │
+│  │  │ Validate passphrase           │── Fail ──▶ LOG WARNING + error     │   │
+│  │  └───────────┬───────────────────┘                                    │   │
+│  │         Pass │                                                        │   │
+│  │              ▼                                                        │   │
+│  │  KMS Decrypt → raw secret (Base64, cached)                            │   │
+│  │    │                                                                  │   │
+│  │    ▼                                                                  │   │
+│  │  Return: {"data": [[0, "base64-raw-secret"]]}                         │   │
+│  │                                                                       │   │
+│  │  Snowflake then does the SHA-256 derivation:                          │   │
+│  │    derive_session_key(secret, session_salt) → wrapped TMK             │   │
+│  └───────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─ AUDIT CORRELATION ──────────────────────────────────────────────────┐   │
+│  │                                                                       │   │
+│  │  CloudWatch Log:                                                      │   │
+│  │    hyok_key_fetch user=JSMITH account=XY12345 query=01b3e... rows=1   │   │
+│  │                                                                       │   │
+│  │           ↕ correlate via sf-external-function-current-query-id        │   │
+│  │                                                                       │   │
+│  │  Snowflake QUERY_HISTORY:                                             │   │
+│  │    QUERY_ID=01b3e...  USER_NAME=JSMITH  QUERY_TEXT=SELECT * FROM ...  │   │
+│  └───────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Encrypt-on-Write vs Decrypt-on-Read Pipeline
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│            TWO INTEGRATION PATTERNS FOR MASKING POLICIES                     │
+│                                                                              │
+│  ═══ Pattern A: Encrypt-on-Write, Decrypt-on-Read ═══                        │
+│                                                                              │
+│  Source Table                 Encrypted Table              Query Result       │
+│  ┌──────────┐   INSERT +     ┌──────────────┐   SELECT +  ┌──────────┐      │
+│  │ John Doe │──encrypt_cbc──▶│ a4Ff29x...   │──decrypt───▶│ John Doe │      │
+│  │ 555-0100 │   (batch ETL)  │ 7bKm31y...   │  masking    │ 555-0100 │      │
+│  │ NYC      │                │ pQ9nR2z...   │  policy     │ NYC      │      │
+│  └──────────┘                └──────────────┘             └──────────┘      │
+│                                                                              │
+│  Best for: Data at rest must be encrypted. Decrypt only for authorized.      │
+│  Used in: 01, 02, 03-key-retrieval, 04                                       │
+│                                                                              │
+│  ═══ Pattern B: Encrypt-on-Read (Transparent Masking) ═══                    │
+│                                                                              │
+│  Source Table                                              Query Result       │
+│  ┌──────────┐   SELECT + encrypt masking policy            ┌──────────────┐  │
+│  │ John Doe │──────────────────────────────────────────────▶│ a4Ff29x...   │  │
+│  │ 555-0100 │   (plaintext stored, encrypted on read)      │ 7bKm31y...   │  │
+│  │ NYC      │                                              │ pQ9nR2z...   │  │
+│  └──────────┘                                              └──────────────┘  │
+│                                                                              │
+│  Best for: Dynamic encryption for data sharing / export without modifying    │
+│            the underlying table. Original data remains plaintext.            │
+│  Used in: Tag-based encrypt_pg policy, ext_encrypt_name policy               │
+│                                                                              │
+│  ═══ Pattern C: Server-Side Crypto via External Function ═══                 │
+│                                                                              │
+│  Source Table            Lambda / Azure Function            Query Result      │
+│  ┌──────────┐   SELECT  ┌─────────────────────────┐       ┌──────────────┐  │
+│  │ John Doe │──────────▶│ AES-CBC encrypt in cloud │──────▶│ a4Ff29x...   │  │
+│  │          │  ext func │ Key stays in Lambda/KV   │       │              │  │
+│  └──────────┘           └─────────────────────────┘       └──────────────┘  │
+│                                                                              │
+│  Best for: Maximum security — key never enters Snowflake at all.             │
+│  Trade-off: Higher latency (network per batch), more infrastructure.         │
+│  Used in: 03-server-side-crypto (ext_encrypt_name, ext_decrypt_name, etc.)   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Performance Benchmarks
 
 Benchmarks from a HYOK load test: **50M rows, 7 encrypted columns, AES-256-GCM**, Singapore (ap-southeast-1). KEY_PER_QUERY-EXTFUNC mode, full-scan aggregation, no optimization.
